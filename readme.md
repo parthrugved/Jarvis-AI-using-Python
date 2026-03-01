@@ -9,16 +9,26 @@ It can listen to voice commands, perform system tasks, open apps/websites, and a
 
 ## 🚀 Features
 
-🎤 **Voice recognition** using microphone  
-🧠 **Offline AI responses** powered by Ollama + Llama 3.1  
-🔊 **Text-to-speech** using macOS built-in voice  
+🎤 **Voice recognition** using microphone 
+
+🧠 **Offline AI responses** powered by Ollama + Llama 3.1 
+ 
+🔊 **Text-to-speech** using macOS built-in voice 
+ 
 🌐 **Open websites** via voice commands  
+
 🖥 **Launch system applications**  
-⏰ **Tell current time** and date  
+
+⏰ **Tell current time** and date 
+ 
 🤖 **Introduce itself**  
-🛑 **Stop command** to exit  
+
+🛑 **Stop command** to exit 
+ 
 🖼 **Modern GUI** (Tkinter) with continuous listening and text input  
+
 🔒 **Works offline** — private and unlimited  
+
 
 ---
 
