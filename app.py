@@ -46,6 +46,8 @@ def ask_ollama(prompt: str) -> str | None:
 # Tracks when macOS TTS is actively speaking so we can avoid listening to our
 # own voice and creating feedback loops.
 SPEAKING = False
+# Current 'say' process so the user can stop it mid-speech (e.g. long Ollama answers).
+_say_process = None
 
 
 # ── Colours ─────────────────────────────────────────────────────────────────────
@@ -67,21 +69,42 @@ def say(text: str) -> None:
     """Speak text asynchronously using macOS `say` at a smooth, slower rate.
 
     While speaking, a global flag is set so the recogniser does not listen to
-    our own TTS output.
+    our own TTS output. The process is stored so stop_speaking() can interrupt.
     """
-    global SPEAKING
+    global SPEAKING, _say_process
     t = text.replace('"', "'")
-    cmd = f'say -r 150 "{t}"'
 
     def _run():
-        global SPEAKING
+        global SPEAKING, _say_process
         SPEAKING = True
+        proc = None
         try:
-            os.system(cmd)
+            proc = subprocess.Popen(
+                ["say", "-r", "150", t],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            _say_process = proc
+            proc.wait()
         finally:
+            _say_process = None
             SPEAKING = False
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+def stop_speaking() -> None:
+    """Stop current TTS (e.g. long Ollama answer) if one is playing."""
+    global SPEAKING, _say_process
+    p = _say_process
+    if p is not None:
+        try:
+            p.terminate()
+            p.wait(timeout=1)
+        except Exception:
+            pass
+        _say_process = None
+    SPEAKING = False
 
 
 # ── Voice engine ────────────────────────────────────────────────────────────────
@@ -121,7 +144,9 @@ class VoiceEngine:
     def _work(self, cb):
         try:
             with sr.Microphone() as s:
-                audio = self._r.listen(s, timeout=8, phrase_time_limit=10)
+                # Wait a bit longer for the user to start speaking, and allow
+                # longer sentences before cutting off.
+                audio = self._r.listen(s, timeout=12, phrase_time_limit=15)
             text = self._r.recognize_google(audio, language="en-in")
             cb(text, None)
         except sr.WaitTimeoutError:
@@ -165,6 +190,8 @@ class JarvisApp:
         self._pulse = 0.0
         self._listening = False
         self._stopping = False  # set to True once user says stop/shutdown
+        self._auto_listen_enabled = True  # continuous background listening
+        self._awaiting_ollama = False     # pause listening while AI is thinking
         # Simple debounce so we don't keep repeating time/date on background noise.
         self._last_time_ts: datetime.datetime | None = None
         self._last_date_ts: datetime.datetime | None = None
@@ -240,7 +267,7 @@ class JarvisApp:
         self._btn = tk.Button(
             left,
             text="⬤  LISTEN",
-            command=self._on_listen,
+            command=lambda: self._on_listen(force=True),
             bg=DIM,
             fg=ACCENT,
             activebackground=ACCENT,
@@ -254,6 +281,44 @@ class JarvisApp:
             width=17,
         )
         self._btn.pack(pady=10)
+
+        # Stop auto listening button
+        self._stop_btn = tk.Button(
+            left,
+            text="■  STOP LISTENING",
+            command=self._stop_listening,
+            bg=PANEL,
+            fg=SUB,
+            activebackground=DIM,
+            activeforeground=ACCENT,
+            relief="flat",
+            bd=0,
+            font=("Courier", 9, "bold"),
+            cursor="hand2",
+            padx=10,
+            pady=6,
+            width=17,
+        )
+        self._stop_btn.pack(pady=(0, 4))
+
+        # Stop talking button — interrupt current TTS (e.g. long Ollama answer)
+        self._stop_talk_btn = tk.Button(
+            left,
+            text="🔇  STOP TALKING",
+            command=self._stop_talking,
+            bg=PANEL,
+            fg=WARN,
+            activebackground=DIM,
+            activeforeground=WARN,
+            relief="flat",
+            bd=0,
+            font=("Courier", 9, "bold"),
+            cursor="hand2",
+            padx=10,
+            pady=6,
+            width=17,
+        )
+        self._stop_talk_btn.pack(pady=(0, 10))
 
         tk.Frame(left, bg=BORDER, height=1).pack(fill="x", pady=4)
 
@@ -606,7 +671,8 @@ class JarvisApp:
             self._set_status("LISTENING…", ACCENT)
             say("Jarvis A.I.")
             # Start the continuous listening loop.
-            self.root.after(300, self._on_listen)
+            if self._auto_listen_enabled:
+                self.root.after(300, self._on_listen)
         else:
             self._log(
                 "Mic calibration failed — check System Settings → "
@@ -648,10 +714,18 @@ class JarvisApp:
         self._log_txt.configure(state="disabled")
 
     # ── Voice + text flows ─────────────────────────────────────────────────────
-    def _on_listen(self) -> None:
+    def _on_listen(self, force: bool = False) -> None:
         # If we're in the middle of speaking or shutting down, delay listening
         # to avoid picking up our own TTS or running while exiting.
         if self._stopping:
+            return
+        # If auto listening is paused or we're waiting for Ollama, ignore
+        # background listens; manual LISTEN can still force a single listen.
+        if not force and (not self._auto_listen_enabled or self._awaiting_ollama):
+            return
+        if self._awaiting_ollama:
+            # Even a forced listen is ignored while Ollama is answering, to
+            # keep the interaction clear.
             return
         if SPEAKING or self._voice.busy:
             self.root.after(500, self._on_listen)
@@ -692,8 +766,25 @@ class JarvisApp:
 
         # Re‑enter listening loop with a small pause for a smoother cadence,
         # unless a shutdown sequence is in progress.
-        if not self._stopping:
+        if not self._stopping and self._auto_listen_enabled and not self._awaiting_ollama:
             self.root.after(700, self._on_listen)
+
+    def _stop_listening(self) -> None:
+        """Pause continuous background listening; LISTEN still works once."""
+        if not self._auto_listen_enabled:
+            return
+        self._auto_listen_enabled = False
+        self._set_status("LISTENING PAUSED", SUB)
+        self._log(
+            "Auto listening paused. Press LISTEN for a single command.",
+            "system",
+        )
+
+    def _stop_talking(self) -> None:
+        """Stop current TTS (e.g. long Ollama answer) so the user can interrupt."""
+        stop_speaking()
+        self._set_status("STANDBY", SUB)
+        self._log("Stopped speaking.", "system")
 
     def _text_cmd(self) -> None:
         q = self._entry.get().strip()
@@ -766,8 +857,10 @@ class JarvisApp:
             question = query.replace("answer", "").replace("Answer", "").strip()
             if question:
                 handled = True
+                self._awaiting_ollama = True
                 self._set_status("ASKING OLLAMA…", ACCENT)
                 self._log(f"Asking Ollama: {question}", "system")
+                self._btn.configure(state="disabled")
 
                 def work():
                     reply = ask_ollama(question)
@@ -822,6 +915,8 @@ class JarvisApp:
 
     def _on_ollama_done(self, reply: str | None, question: str) -> None:
         """Called on main thread after Ollama request finishes."""
+        self._awaiting_ollama = False
+        self._btn.configure(state="normal")
         if reply is None:
             self._log(
                 "Ollama unavailable. Is it running on localhost:11434?",
@@ -833,6 +928,10 @@ class JarvisApp:
             self._log(reply, "jarvis")
             self._set_status("SPEAKING", OK, 4000)
             say(reply)
+
+        # Resume auto listening if it is enabled and we're not shutting down.
+        if not self._stopping and self._auto_listen_enabled:
+            self.root.after(700, self._on_listen)
 
     # ── Site / app helpers ─────────────────────────────────────────────────────
     def _open_site(self, name: str, url: str) -> None:
