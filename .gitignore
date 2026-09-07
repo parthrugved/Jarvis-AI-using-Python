@@ -17,3 +17,4 @@ main.spec
 fingerprint.png
 temp.py
 app.spec
+.DS_Store
